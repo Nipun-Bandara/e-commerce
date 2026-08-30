@@ -4,7 +4,7 @@ import { notFound } from "next/navigation";
 import CategoryNav from "@/components/category-nav";
 import Pagination from "@/components/pagination";
 import ProductGrid from "@/components/product-grid";
-import { parsePageParam } from "@/lib/pagination";
+import { pageHref, parsePageParam } from "@/lib/pagination";
 import { getCategoryBySlug, listCategories } from "@/server/categories";
 import { getProducts } from "@/server/products";
 
@@ -61,7 +61,9 @@ export default async function CategoryPage({
       <Pagination
         page={page}
         pageCount={pageCount}
-        basePath={`/products/category/${category.slug}`}
+        hrefForPage={(next) =>
+          pageHref(`/products/category/${category.slug}`, next)
+        }
       />
     </div>
   );
