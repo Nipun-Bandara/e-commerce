@@ -1,3 +1,5 @@
+import type { ReactNode } from "react";
+
 import ProductCard from "@/components/product-card";
 import type { ProductListItem } from "@/server/products";
 
@@ -8,15 +10,23 @@ import type { ProductListItem } from "@/server/products";
 export default function ProductGrid({
   products,
   emptyMessage = "No products to show here yet.",
+  emptyAction,
 }: {
   products: ProductListItem[];
   emptyMessage?: string;
+  /** A way out of the empty state, e.g. a "clear all filters" link. */
+  emptyAction?: ReactNode;
 }) {
   if (products.length === 0) {
     return (
       <div className="rounded-xl border border-dashed border-border px-6 py-16 text-center">
         <p className="text-sm font-medium">Nothing here</p>
-        <p className="mt-1 text-sm text-muted-foreground">{emptyMessage}</p>
+        <p className="mx-auto mt-1 max-w-md text-sm text-muted-foreground">
+          {emptyMessage}
+        </p>
+        {emptyAction && (
+          <div className="mt-4 flex justify-center">{emptyAction}</div>
+        )}
       </div>
     );
   }
