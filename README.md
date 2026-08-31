@@ -2,10 +2,8 @@
 
 An e-commerce storefront built with Next.js, Prisma and PostgreSQL. Prices are in LKR.
 
-**Status: foundation only.** This repository contains the project scaffold, the complete
-database schema, seed data and the conventions doc. There are no user-facing features
-yet — no authentication, cart, product pages, checkout or admin. The home page is still
-the Next.js default.
+**Status: in progress.** The catalogue, search and filters, the cart and authentication
+are built. Checkout, orders and the admin screens are not.
 
 ## Stack
 
@@ -13,6 +11,7 @@ the Next.js default.
 - [Tailwind CSS 4](https://tailwindcss.com)
 - [shadcn/ui](https://ui.shadcn.com) (Radix primitives, `radix-nova` style)
 - [Prisma 7](https://www.prisma.io) with PostgreSQL 16
+- [Auth.js](https://authjs.dev) (NextAuth v5) — email and password, JWT sessions
 - pnpm
 
 ## Requirements
@@ -47,7 +46,12 @@ Port 5433 avoids colliding with a Postgres already running on 5432.
 cp .env.example .env
 ```
 
-Then set `DATABASE_URL`. The default in `.env.example` matches the Docker command above.
+Then set `DATABASE_URL` — the default in `.env.example` matches the Docker command above —
+and `AUTH_SECRET`, which signs the session cookie. Generate one with:
+
+```bash
+openssl rand -base64 32
+```
 
 **4. Create the schema**
 
@@ -63,6 +67,17 @@ pnpm db:seed
 
 Inserts 5 categories, 30 products with placeholder images, and 3 users. The script is
 idempotent — running it again is safe and changes nothing.
+
+Seeded accounts have real bcrypt password hashes, so you can sign in with them:
+
+| Email | Password | Role |
+| --- | --- | --- |
+| `admin@ecom.lk` | `admin-password` | `ADMIN` |
+| `amara@example.com` | `user-password` | `USER` |
+| `dinuka@example.com` | `user-password` | `USER` |
+
+These are development credentials and are re-written on every seed. Seeded data does not
+belong in a deployed database.
 
 **6. Run the app**
 
@@ -113,6 +128,24 @@ Two things to know before writing queries:
 - **`OrderItem` snapshots `productName` and `unitPrice`**, and `Order` snapshots the
   shipping address. Historical orders read those columns, never the live `Product` or
   `Address` row, so a rename, reprice or delete cannot rewrite history.
+
+## Authentication
+
+Email and password via Auth.js with the Credentials provider. Sessions are JWTs in an
+httpOnly cookie — the strategy Credentials requires — carrying the user's id and role.
+
+- Sign up at `/register`, sign in at `/login`. Both validate with Zod **on the server**;
+  the browser's `required` and `type="email"` are only there to save a round trip.
+- Passwords are hashed with bcrypt at cost 12, in `src/server/users.ts`. Nothing else
+  reads or writes a hash.
+- A cart filled as a guest is merged into the account on sign-in — quantities for the
+  same product are added together and clamped to stock. See `mergeGuestCart` in
+  `src/server/cart.ts`.
+- `src/proxy.ts` (Next 16's renamed Middleware) redirects unauthenticated visitors away
+  from `/account/*` and `/admin/*` to `/login?callbackUrl=…`. It is an optimistic check:
+  the real gate is `requireAuth()` / `requireAdmin()` in `src/server/auth.ts`, which
+  every protected page calls. A signed-in non-admin who opens `/admin` gets a 403 page,
+  not a redirect.
 
 ## Conventions
 

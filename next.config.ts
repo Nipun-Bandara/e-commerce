@@ -9,6 +9,14 @@ const nextConfig: NextConfig = {
     // re-checking the pattern, so only the entry host needs allowing.
     remotePatterns: [new URL("https://picsum.photos/seed/**")],
   },
+
+  experimental: {
+    // Enables `forbidden()` and the `forbidden.tsx` boundary, which is how a
+    // signed-in non-admin gets a real 403 page instead of a redirect back to a
+    // login form they do not need. Still experimental in Next 16; if it is ever
+    // removed, `src/server/auth.ts` is the one place that calls it.
+    authInterrupts: true,
+  },
 };
 
 export default nextConfig;
