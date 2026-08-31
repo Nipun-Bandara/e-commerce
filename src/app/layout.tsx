@@ -1,5 +1,8 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+
+import SiteHeader from "@/components/site-header";
+import { ToastProvider } from "@/components/ui/toast";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -23,7 +26,20 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       lang="en"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col">{children}</body>
+      <body className="min-h-full flex flex-col">
+        {/*
+          The provider wraps the tree so any client component can raise a toast,
+          but `children` are still rendered on the server and passed through as
+          a prop — nothing below is pulled into the client bundle by this.
+
+          Header and children stay direct flex children of <body>, which is what
+          lets a page claim the remaining height with `flex-1`.
+        */}
+        <ToastProvider>
+          <SiteHeader />
+          {children}
+        </ToastProvider>
+      </body>
     </html>
   );
 }
