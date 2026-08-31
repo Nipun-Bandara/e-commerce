@@ -11,15 +11,21 @@ import {
 } from "@/lib/cart-result";
 import { lineTotal, money, sumMoney, type Money } from "@/lib/money";
 import { prisma } from "@/lib/prisma";
+import { getCurrentUser } from "@/server/auth";
 
 /**
- * The guest cart: reads, mutations, and the one place a request is resolved to
- * a Cart row.
+ * The cart: reads, mutations, and the one place a request is resolved to a
+ * Cart row.
  *
- * There is no authentication yet, so a cart is identified by an opaque session
- * id kept in an httpOnly cookie. That id is a bearer token — whoever holds it
- * holds the cart — which is why it is 256 bits of randomness, why the browser's
+ * A cart belongs to a signed-in user, or — for a guest — to an opaque session
+ * id kept in an httpOnly cookie. That id is a bearer token: whoever holds it
+ * holds the cart, which is why it is 256 bits of randomness, why the browser's
  * JavaScript cannot read it, and why it is never rendered into page markup.
+ * `Cart.userId` and `Cart.sessionId` are each nullable and unique, so the two
+ * kinds of cart live in one table without colliding.
+ *
+ * Signing in runs {@link mergeGuestCart}, which folds whatever a visitor
+ * collected as a guest into their account and retires the cookie.
  *
  * Nothing here takes a price from the caller. A cart row stores a product id
  * and a quantity; the price is read from the Product table at display time, so
@@ -98,16 +104,31 @@ const cartItemSelect = {
 /**
  * Resolve the current request to a cart row, creating one if needed.
  *
- * **Every mutation goes through here, and nothing else looks up a cart.** When
- * authentication arrives, merging a guest cart into the signed-in user's cart
- * is a change to this function alone: read the session, read the user, move the
- * rows, drop the cookie. No caller needs to know it happened.
+ * **Every mutation goes through here, and nothing else looks up a cart.** Which
+ * cart that is depends on who is asking: a signed-in visitor is matched on
+ * `userId`, a guest on the session cookie. Nothing else in the module — and
+ * nothing in any caller — has to know which case it is in.
+ *
+ * A signed-in visitor never gets a cart cookie written or refreshed. Their cart
+ * is keyed to their account, so a session id would be a second, competing
+ * identity for the same basket.
  *
  * Only callable from a Server Function or Route Handler — it writes a
  * `Set-Cookie` header, which Next.js forbids during rendering. Reads that
  * happen while a page renders use {@link findCart} instead.
  */
 export async function getOrCreateCart() {
+  const user = await getCurrentUser();
+
+  if (user) {
+    return prisma.cart.upsert({
+      where: { userId: user.id },
+      create: { userId: user.id },
+      update: {},
+      select: { id: true },
+    });
+  }
+
   const cookieStore = await cookies();
   const sessionId =
     cookieStore.get(CART_SESSION_COOKIE)?.value ||
@@ -137,8 +158,20 @@ export async function getOrCreateCart() {
  * The read-only half of {@link getOrCreateCart}: never writes a cookie, so it
  * is safe during rendering. `null` means "this visitor has no cart yet", which
  * every reader treats as an empty one.
+ *
+ * Keyed the same way round — user first, cookie second — so a page and a
+ * mutation in the same request always agree on which cart they are looking at.
  */
 async function findCart() {
+  const user = await getCurrentUser();
+
+  if (user) {
+    return prisma.cart.findUnique({
+      where: { userId: user.id },
+      select: { id: true },
+    });
+  }
+
   const cookieStore = await cookies();
   const sessionId = cookieStore.get(CART_SESSION_COOKIE)?.value;
   if (!sessionId) return null;
@@ -387,4 +420,106 @@ export async function clearCart(): Promise<CartResult> {
   await prisma.cartItem.deleteMany({ where: { cartId: cart.id } });
 
   return cartSuccess("Your cart is now empty.");
+}
+
+/**
+ * Fold the guest cart into `userId`'s cart. Called once, immediately after a
+ * successful sign-in or sign-up.
+ *
+ * Someone who fills a basket and *then* logs in has done nothing wrong, and
+ * losing that basket is the kind of thing that loses the sale. So the guest
+ * cart is not discarded: it is either claimed outright (the account has no cart
+ * yet — one `UPDATE`, no rows to copy) or merged row by row.
+ *
+ * Takes the id rather than reading the session, because the caller has just
+ * issued the token and this request may still be carrying the cookie for it.
+ *
+ * The whole thing is one transaction. Half a merge — items moved but the guest
+ * cart still standing, or the cart deleted with its contents nowhere — is worse
+ * than no merge, and the delete at the end is what makes that possible.
+ */
+export async function mergeGuestCart(userId: string): Promise<void> {
+  const cookieStore = await cookies();
+  const sessionId = cookieStore.get(CART_SESSION_COOKIE)?.value;
+
+  // No cookie means nothing to merge: this visitor never had a guest cart.
+  if (!sessionId) return;
+
+  await prisma.$transaction(async (tx) => {
+    const guestCart = await tx.cart.findUnique({
+      where: { sessionId },
+      select: {
+        id: true,
+        items: { select: { productId: true, quantity: true } },
+      },
+    });
+    if (!guestCart) return;
+
+    const userCart = await tx.cart.findUnique({
+      where: { userId },
+      select: { id: true },
+    });
+
+    if (!userCart) {
+      // Nothing to merge into, so hand over the row itself. Clearing
+      // `sessionId` is not tidying: it is what stops the cookie, if it somehow
+      // survives, from reaching a cart that now belongs to an account.
+      await tx.cart.update({
+        where: { id: guestCart.id },
+        data: { userId, sessionId: null },
+      });
+      return;
+    }
+
+    if (guestCart.items.length > 0) {
+      const productIds = guestCart.items.map((item) => item.productId);
+
+      // Two batched reads rather than a query per line: a merge is the one
+      // moment a cart is touched wholesale.
+      const products = await tx.product.findMany({
+        where: { id: { in: productIds } },
+        select: { id: true, stock: true },
+      });
+      const stockById = new Map(products.map((p) => [p.id, p.stock]));
+
+      const existingItems = await tx.cartItem.findMany({
+        where: { cartId: userCart.id, productId: { in: productIds } },
+        select: { productId: true, quantity: true },
+      });
+      const existingByProduct = new Map(
+        existingItems.map((item) => [item.productId, item.quantity]),
+      );
+
+      for (const item of guestCart.items) {
+        const stock = stockById.get(item.productId);
+
+        // The product was deleted between the guest adding it and signing in.
+        // The foreign key would reject the row anyway.
+        if (stock === undefined) continue;
+
+        const combined = (existingByProduct.get(item.productId) ?? 0) + item.quantity;
+
+        // Clamped to stock, but never below 1: a cart row of zero is not a row,
+        // and silently dropping something the visitor picked out is exactly the
+        // loss this function exists to prevent. `getCart` already shows an
+        // out-of-stock line with a warning rather than hiding it.
+        const quantity = Math.max(1, Math.min(combined, stock));
+
+        await tx.cartItem.upsert({
+          where: {
+            cartId_productId: { cartId: userCart.id, productId: item.productId },
+          },
+          create: { cartId: userCart.id, productId: item.productId, quantity },
+          update: { quantity },
+        });
+      }
+    }
+
+    // Cascades the guest cart's items away with it.
+    await tx.cart.delete({ where: { id: guestCart.id } });
+  });
+
+  // Only once the transaction has committed. Dropping the cookie first would
+  // strand the guest cart if the merge then rolled back.
+  cookieStore.delete(CART_SESSION_COOKIE);
 }

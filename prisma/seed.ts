@@ -1,3 +1,4 @@
+import bcrypt from "bcrypt";
 import { PrismaPg } from "@prisma/adapter-pg";
 
 import { PrismaClient, Role } from "../src/generated/prisma/client";
@@ -13,6 +14,10 @@ import { PrismaClient, Role } from "../src/generated/prisma/client";
  *
  * Prices are LKR and are written as strings. A money value must never pass
  * through a JS number — see the Decimal rule in CLAUDE.md.
+ *
+ * Seeded users have real bcrypt password hashes and can be logged into. The
+ * passwords are below and in the README — they are development credentials, and
+ * this data has no business in a deployed database.
  */
 
 const connectionString = process.env.DATABASE_URL;
@@ -417,26 +422,37 @@ const products: ProductSeed[] = [
 ];
 
 /**
- * Placeholder credential. Authentication is not implemented yet, so no seeded
- * account can be logged into — replace this with a real hash when auth lands.
+ * Development passwords, hashed with bcrypt at the same cost the app uses.
+ *
+ * These are written in plain sight because they are meant to be: they exist so
+ * a developer can log in to a local database, and they are documented in the
+ * README for that reason. Nothing seeded belongs in a deployed environment.
+ *
+ * Hashed at seed time rather than pasted in as constants so that the cost
+ * factor stays in one place and re-seeding after a cost change produces current
+ * hashes. Three bcrypt rounds add about a second to the seed; that is the
+ * price of the hash being real.
  */
-const PLACEHOLDER_PASSWORD_HASH = "seed-placeholder-not-a-real-hash";
+const BCRYPT_COST = 12;
 
 const users = [
   {
     email: "admin@ecom.lk",
     name: "Store Admin",
     role: Role.ADMIN,
+    password: "admin-password",
   },
   {
     email: "amara@example.com",
     name: "Amara Perera",
     role: Role.USER,
+    password: "user-password",
   },
   {
     email: "dinuka@example.com",
     name: "Dinuka Fernando",
     role: Role.USER,
+    password: "user-password",
   },
 ];
 
@@ -508,11 +524,16 @@ async function seedProducts(categoryIds: Map<string, string>): Promise<void> {
 }
 
 async function seedUsers(): Promise<void> {
-  for (const user of users) {
+  for (const { password, ...user } of users) {
+    const passwordHash = await bcrypt.hash(password, BCRYPT_COST);
+
     await prisma.user.upsert({
       where: { email: user.email },
-      update: { name: user.name, role: user.role },
-      create: { ...user, passwordHash: PLACEHOLDER_PASSWORD_HASH },
+      // The hash is rewritten on every run, not only on create. A re-seed is
+      // how you get a known-good login back after poking at a local database,
+      // and a stale hash left in `update` would quietly defeat that.
+      update: { name: user.name, role: user.role, passwordHash },
+      create: { ...user, passwordHash },
     });
   }
 

@@ -3,12 +3,13 @@ import Link from "next/link";
 import { ShoppingBagIcon } from "lucide-react";
 
 import CartCountBadge from "@/components/cart-count-badge";
+import HeaderAuth from "@/components/header-auth";
 import { buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 /**
  * The site-wide header, mounted in the root layout so the cart is reachable —
- * and its count visible — from every page.
+ * and its count visible — from every page, alongside who is signed in.
  */
 export default function SiteHeader() {
   return (
@@ -24,20 +25,28 @@ export default function SiteHeader() {
           </Link>
         </nav>
 
-        <Link
-          href="/cart"
-          // `cn` is not optional: it is what drops the `border-transparent` in
-          // the button base that would otherwise beat a later border utility.
-          className={cn(buttonVariants({ variant: "ghost", size: "lg" }), "ml-auto")}
-        >
-          <ShoppingBagIcon aria-hidden />
-          <span className="hidden sm:inline">Cart</span>
-          {/* No fallback: an empty badge is the same as no badge, and a
-              placeholder that pops into a number reads as a glitch. */}
+        <div className="ml-auto flex items-center gap-1">
+          <Link
+            href="/cart"
+            // `cn` is not optional: it is what drops the `border-transparent` in
+            // the button base that would otherwise beat a later border utility.
+            className={cn(buttonVariants({ variant: "ghost", size: "lg" }))}
+          >
+            <ShoppingBagIcon aria-hidden />
+            <span className="hidden sm:inline">Cart</span>
+            {/* No fallback: an empty badge is the same as no badge, and a
+                placeholder that pops into a number reads as a glitch. */}
+            <Suspense fallback={null}>
+              <CartCountBadge />
+            </Suspense>
+          </Link>
+
+          {/* Same reasoning as the badge: nothing beats something that flickers
+              from "Login" into a name. */}
           <Suspense fallback={null}>
-            <CartCountBadge />
+            <HeaderAuth />
           </Suspense>
-        </Link>
+        </div>
       </div>
     </header>
   );

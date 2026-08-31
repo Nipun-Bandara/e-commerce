@@ -6,3 +6,4 @@ allowBuilds:
   sharp: false
   unrs-resolver: false
   workerd: false
+  bcrypt: false
