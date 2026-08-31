@@ -2,9 +2,9 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 
+import AddToCartForm from "@/components/add-to-cart-form";
 import ProductGallery from "@/components/product-gallery";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
 import { formatPrice } from "@/lib/money";
 import { getProductBySlug } from "@/server/products";
 
@@ -97,10 +97,7 @@ export default async function ProductPage({
             </span>
           </div>
 
-          {/* Placeholder only — the cart is not part of this phase. */}
-          <Button size="lg" className="w-full sm:w-64" disabled>
-            Add to cart
-          </Button>
+          <AddToCartForm productId={product.id} stock={product.stock} />
 
           {/* A plain rule rather than <Separator />: that shadcn primitive is
               a Client Component, and the gallery is meant to be the only one
