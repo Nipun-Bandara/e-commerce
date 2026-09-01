@@ -4,7 +4,7 @@ import { useActionState } from "react";
 import Link from "next/link";
 import { TriangleAlertIcon } from "lucide-react";
 
-import AuthFormField from "@/components/auth-form-field";
+import FormField from "@/components/form-field";
 import { Button } from "@/components/ui/button";
 import { emptyAuthFormState } from "@/lib/auth-schemas";
 import { loginAction } from "@/server/auth-actions";
@@ -43,7 +43,7 @@ export default function LoginForm({ callbackUrl }: { callbackUrl: string }) {
         </p>
       ) : null}
 
-      <AuthFormField
+      <FormField
         name="email"
         label="Email"
         type="email"
@@ -54,7 +54,7 @@ export default function LoginForm({ callbackUrl }: { callbackUrl: string }) {
         autoFocus
       />
 
-      <AuthFormField
+      <FormField
         name="password"
         label="Password"
         type="password"

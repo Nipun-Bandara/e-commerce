@@ -1,5 +1,7 @@
 import * as z from "zod";
 
+import { toFieldErrors as toFormFieldErrors } from "@/lib/form-errors";
+
 /**
  * What a valid sign-up or login submission looks like, and the shape the forms
  * get back when it is not one.
@@ -89,15 +91,5 @@ export const emptyAuthFormState: AuthFormState = {
 export function toFieldErrors(
   error: z.ZodError<unknown>,
 ): Partial<Record<AuthField, string>> {
-  const { fieldErrors } = z.flattenError(error);
-  const result: Partial<Record<AuthField, string>> = {};
-
-  for (const [field, messages] of Object.entries(fieldErrors)) {
-    // One message per input. Zod reports every failed rule, but a field can
-    // only usefully show the first thing wrong with it.
-    const [first] = messages as string[];
-    if (first) result[field as AuthField] = first;
-  }
-
-  return result;
+  return toFormFieldErrors<AuthField>(error);
 }

@@ -1,11 +1,11 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { ShoppingBagIcon } from "lucide-react";
+import { ShoppingBagIcon, TriangleAlertIcon } from "lucide-react";
 
 import CartClearButton from "@/components/cart-clear-button";
 import CartItemRow from "@/components/cart-item-row";
-import { Badge } from "@/components/ui/badge";
-import { Button, buttonVariants } from "@/components/ui/button";
+import CheckoutButton from "@/components/checkout-button";
+import { buttonVariants } from "@/components/ui/button";
 import { formatPrice } from "@/lib/money";
 import { cn } from "@/lib/utils";
 import { getCart } from "@/server/cart";
@@ -15,10 +15,19 @@ export const metadata: Metadata = {
   description: "Review the items in your cart before checking out.",
 };
 
-export default async function CartPage() {
+/** What checkout sets on the query string when it sends someone back here. */
+const BOUNCED_FROM_CHECKOUT = "changed";
+
+export default async function CartPage({ searchParams }: PageProps<"/cart">) {
+  const { checkout } = await searchParams;
   const cart = await getCart();
 
   if (cart.items.length === 0) return <EmptyCart />;
+
+  // The same three conditions checkout revalidates against. Rows carry their
+  // own explanation — `CartItemRow` renders a warning with a way out of each —
+  // so this only decides whether the way forward is open.
+  const blockedItems = cart.items.filter((item) => item.issue).length;
 
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-4 py-10 sm:px-6 lg:px-8">
@@ -32,6 +41,18 @@ export default async function CartPage() {
 
         <CartClearButton />
       </header>
+
+      {checkout === BOUNCED_FROM_CHECKOUT ? (
+        <p
+          role="alert"
+          className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2.5 text-sm text-destructive"
+        >
+          <TriangleAlertIcon className="mt-0.5 size-4 shrink-0" aria-hidden />
+          Some of these items changed while they were in your cart, so checkout
+          stopped rather than order something different from what you reviewed.
+          Each affected row below says what happened.
+        </p>
+      ) : null}
 
       <div className="flex flex-col gap-10 lg:flex-row lg:items-start">
         <ul className="min-w-0 flex-1">
@@ -55,12 +76,17 @@ export default async function CartPage() {
               Delivery is calculated at checkout.
             </p>
 
-            <div className="flex flex-col items-center gap-2">
-              <Button size="lg" className="w-full" disabled>
-                Proceed to checkout
-              </Button>
-              <Badge variant="secondary">Coming soon</Badge>
-            </div>
+            {/* The empty case is checked here as well as by the early return
+                above, so the rule "no items, no checkout" does not depend on a
+                branch somewhere else in the file staying where it is. */}
+            <CheckoutButton
+              blocked={cart.items.length === 0 || blockedItems > 0}
+              blockedReason={
+                blockedItems > 0
+                  ? `Sort out ${blockedItems === 1 ? "the item" : `the ${blockedItems} items`} flagged above to continue.`
+                  : undefined
+              }
+            />
 
             <Link
               href="/products"
