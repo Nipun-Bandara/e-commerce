@@ -56,5 +56,16 @@ export const proxy = auth((request) => {
 export const config = {
   // Only these paths. Everything else — the catalogue, the cart, the sign-in
   // endpoints — is public and must not pay for a session read on every request.
-  matcher: ["/account/:path*", "/admin/:path*", "/login", "/register"],
+  //
+  // `/checkout` exactly, not `/checkout/:path*`. A confirmation page under it
+  // answers a stranger with 404 rather than a redirect, precisely so that order
+  // numbers cannot be probed; a redirect to login would tell them the URL was
+  // worth signing in for.
+  matcher: [
+    "/account/:path*",
+    "/admin/:path*",
+    "/checkout",
+    "/login",
+    "/register",
+  ],
 };

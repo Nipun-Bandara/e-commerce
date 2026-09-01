@@ -4,16 +4,18 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
 /**
- * One labelled input on the login or sign-up form, with its error message.
+ * One labelled input, with its error message. Used by every form in the app.
  *
  * The error is wired up with `aria-describedby` and `aria-invalid` rather than
  * just rendered in red: a screen reader otherwise announces the field as fine
  * and the message as a stray sentence somewhere below it.
  *
- * `defaultValue` rather than `value` — these forms are uncontrolled, and the
- * server echoes back what was typed so a rejected submit does not blank them.
+ * Controlled or not is the caller's choice. The auth forms are uncontrolled and
+ * pass `defaultValue`, because the server echoes back what was typed so a
+ * rejected submit does not blank them; checkout is controlled and passes
+ * `value`, because picking a saved address rewrites every field at once.
  */
-export default function AuthFormField({
+export default function FormField({
   name,
   label,
   type = "text",
