@@ -24,6 +24,24 @@ export type StockLine = {
 };
 
 /**
+ * The order stock writes must happen in, whatever order their caller read them.
+ *
+ * Both writes below take Postgres row locks, and two transactions that take the
+ * same locks in a different sequence deadlock. Each operation being internally
+ * consistent is not enough — a checkout and a cancellation touching the same two
+ * products have to agree with *each other*, and they only do if the ordering is
+ * one rule rather than one rule per caller.
+ *
+ * Product id, not name: it is the only key here that is stable, unique, and
+ * never rewritten. `placeOrder` reads its lines in product-name order because
+ * that is the order the visitor saw them in, which is a display concern and
+ * expressly not this one.
+ */
+export function inLockOrder<T extends StockLine>(lines: readonly T[]): T[] {
+  return [...lines].sort((a, b) => a.productId.localeCompare(b.productId));
+}
+
+/**
  * Reserve `quantity` units, if there are that many. Returns whether there were.
  *
  * The check is in the `WHERE`, not in this process: `stock >= quantity` is
@@ -63,19 +81,17 @@ export async function takeStock(
  * No `isActive` condition either. A deactivated product is one that is not for
  * sale, not one whose stock figure has stopped being true.
  *
- * Lines are written in id order so two concurrent restorations touching the
- * same products take their row locks in the same sequence and cannot deadlock.
- * Calling this twice for one order would double the stock, so the caller must
- * ensure it runs once — `cancelOrder` does that with a conditional update that
- * only one transaction can win.
+ * Lines are written in {@link inLockOrder} so that concurrent restorations —
+ * and concurrent checkouts, which use the same ordering — take their row locks
+ * in the same sequence and cannot deadlock. Calling this twice for one order
+ * would double the stock, so the caller must ensure it runs once; `cancelOrder`
+ * does that with a conditional update that only one transaction can win.
  */
 export async function restoreStock(
   tx: Prisma.TransactionClient,
   lines: StockLine[],
 ): Promise<void> {
-  for (const line of [...lines].sort((a, b) =>
-    a.productId.localeCompare(b.productId),
-  )) {
+  for (const line of inLockOrder(lines)) {
     await tx.product.updateMany({
       where: { id: line.productId },
       data: { stock: { increment: line.quantity } },

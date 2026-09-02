@@ -153,20 +153,24 @@ export function getAdminProductById(id: string) {
 }
 
 /**
- * The counts on the dashboard.
+ * The catalogue counts on the dashboard.
  *
- * One `$transaction` so the four numbers describe the same instant. They are
+ * One `$transaction` so the three numbers describe the same instant. They are
  * independent queries and would be correct enough run separately, but a
  * dashboard that says "30 products, 31 of them out of stock" because a write
  * landed between two counts is the kind of thing that costs an hour to
  * disbelieve.
+ *
+ * The order count used to be a fourth entry here. It moved to
+ * `getAdminOrderStats`, which counts orders several ways in one transaction of
+ * its own — two order counts on one page that could disagree is exactly the
+ * problem this function was grouped to avoid.
  */
 export function getAdminStats() {
   return prisma.$transaction([
     prisma.product.count(),
     prisma.product.count({ where: { stock: 0 } }),
     prisma.category.count(),
-    prisma.order.count(),
   ]);
 }
 

@@ -2,7 +2,10 @@ import { OrderStatus } from "@/generated/prisma/enums";
 import { parsePageParam } from "@/lib/pagination";
 
 /**
- * Everything the order history knows about `OrderStatus` that is not a query.
+ * Everything this app knows about `OrderStatus` that is not a query: labels,
+ * colours, the happy path, and which statuses mean money. The rules about
+ * *moving between* them live in `order-transitions.ts`, which is an admin
+ * concern and imports the labels from here.
  *
  * It lives in `lib/` rather than beside the queries for the reason
  * `cart-result.ts` gives: both sides of the network boundary need it. The list
@@ -85,6 +88,36 @@ export function isCancellable(status: OrderStatus): boolean {
   return (CANCELLABLE_STATUSES as readonly OrderStatus[]).includes(status);
 }
 
+/**
+ * The statuses whose orders count as money the shop has taken.
+ *
+ * `PENDING` is excluded because nothing has been paid yet, and `CANCELLED`
+ * because whatever was paid is not revenue. Everything else is an order that
+ * was paid for and is somewhere between the warehouse and the door.
+ *
+ * Here rather than beside the aggregation in `server/admin-orders.ts` because
+ * the dashboard names these four statuses in its own copy, and a figure whose
+ * caption is maintained separately from its `WHERE` clause is a figure that
+ * eventually lies about itself.
+ */
+export const REVENUE_STATUSES = [
+  OrderStatus.PAID,
+  OrderStatus.PROCESSING,
+  OrderStatus.SHIPPED,
+  OrderStatus.DELIVERED,
+] as const;
+
+/**
+ * Whether an arbitrary value is one of the six statuses.
+ *
+ * Everything that reaches a Server Action or a query string crossed the network,
+ * so its TypeScript type is a claim rather than a fact. This is the check that
+ * turns the claim into one.
+ */
+export function isOrderStatus(value: unknown): value is OrderStatus {
+  return typeof value === "string" && value in OrderStatus;
+}
+
 /** What the status dropdown offers, in the order it lists them. */
 export const ORDER_STATUS_FILTERS = [
   { value: "", label: "All orders" },
@@ -119,7 +152,7 @@ export function parseOrderStatusParam(
   const raw = Array.isArray(value) ? value[0] : value;
   if (!raw) return undefined;
 
-  return raw in OrderStatus ? (raw as OrderStatus) : undefined;
+  return isOrderStatus(raw) ? raw : undefined;
 }
 
 export function parseOrderFilters(params: RawSearchParams): OrderFilters {
