@@ -43,9 +43,7 @@ export default function UserMenu({ name }: { name: string }) {
         </DropdownMenuItem>
 
         <DropdownMenuItem asChild>
-          {/* Orders are not built yet. The link goes to the account page rather
-              than nowhere, so nothing in the menu is a dead end. */}
-          <Link href="/account">
+          <Link href="/account/orders">
             <PackageIcon aria-hidden />
             My orders
           </Link>
