@@ -2,8 +2,8 @@
 
 An e-commerce storefront built with Next.js, Prisma and PostgreSQL. Prices are in LKR.
 
-**Status: in progress.** The catalogue, search and filters, the cart and authentication
-are built. Checkout, orders and the admin screens are not.
+**Status: in progress.** The catalogue, search and filters, the cart, authentication,
+checkout, orders, the admin screens and PayHere payments are built.
 
 ## Stack
 
@@ -146,6 +146,102 @@ httpOnly cookie — the strategy Credentials requires — carrying the user's id
   the real gate is `requireAuth()` / `requireAdmin()` in `src/server/auth.ts`, which
   every protected page calls. A signed-in non-admin who opens `/admin` gets a 403 page,
   not a redirect.
+
+## Payments
+
+Checkout hands off to [PayHere](https://www.payhere.lk), in sandbox mode by default.
+`createOrder` writes the order as `PENDING` and commits its stock; the gateway decides
+what happens next.
+
+```
+/checkout  ──▶ order created (PENDING, stock held)
+           ──▶ /checkout/pay/[orderNumber]   signed form POSTed to PayHere
+                     │
+   PayHere ──────────┼──────────▶ browser: /checkout/success/[orderNumber]
+                     │                      or /checkout/cancelled/[orderNumber]
+                     └──────────▶ server:  POST /api/payments/payhere/notify
+                                           ── the only writer of PAID ──
+```
+
+**The return URL is not proof of payment.** Anyone can type
+`/checkout/success/ORD-…`, so that page only ever *reads* `Order.status`. The signed
+server-to-server callback at `/api/payments/payhere/notify` is what changes it, and it
+verifies the `md5sig` checksum with the merchant secret, checks the amount and currency
+against the stored total, and refuses anything that does not match with a `400`.
+
+- **Idempotent.** PayHere retries. Both status changes are conditional updates on
+  `status = PENDING`, so a repeated notification matches no row and does nothing.
+- **Never backwards.** The same condition is what stops a late `cancelled` undoing a
+  payment, or a `success` reviving a cancelled order.
+- **Stock comes back exactly once.** Restoration runs inside the branch that won that
+  conditional update, and nowhere else.
+
+Configuration lives in [`src/lib/payhere.ts`](src/lib/payhere.ts) — the endpoint switch,
+both hash formulas and the status-code table. `PAYHERE_SANDBOX` picks the endpoint;
+anything but the exact string `false` means sandbox. The module is `server-only`, so
+`PAYHERE_MERCHANT_SECRET` cannot reach the browser bundle.
+
+Set `PAYHERE_MERCHANT_ID` and `PAYHERE_MERCHANT_SECRET` from a
+[sandbox merchant account](https://sandbox.payhere.lk) to enable payments. Without them
+the app still builds and runs — the payment step says payments are not configured.
+
+Test cards are published in PayHere's
+[Sandbox & Testing guide](https://support.payhere.lk/sandbox-and-testing). `4916217501611292`
+(Visa) pays successfully and `4024007194349121` (Visa) declines for insufficient funds,
+which is the one to use for checking that stock comes back. Name, CVV and expiry can be
+any valid values.
+
+### Testing the webhook locally
+
+PayHere calls `notify_url` from its own servers and cannot reach `localhost`, so a
+payment made against a local dev server will redirect the browser back but never mark
+the order `PAID`. Expose the app on a public URL to test the full round trip.
+
+**1. Start the dev server**
+
+```bash
+pnpm dev
+```
+
+**2. Open a tunnel to port 3000**
+
+With [ngrok](https://ngrok.com):
+
+```bash
+ngrok http 3000
+```
+
+Or with a [Cloudflare tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/), which needs no account:
+
+```bash
+cloudflared tunnel --url http://localhost:3000
+```
+
+Both print a public HTTPS URL, e.g. `https://oddly-named-thing.ngrok-free.app`.
+
+**3. Point the app at the tunnel**
+
+`NEXT_PUBLIC_APP_URL` is what the return, cancel and notify URLs are built from, so it
+has to be the tunnel URL while testing — with `localhost` in it, PayHere has nothing to
+call back to:
+
+```bash
+NEXT_PUBLIC_APP_URL="https://oddly-named-thing.ngrok-free.app"
+```
+
+Restart `pnpm dev` after changing it. Add the same domain under **Settings → Domains &
+Credentials** in the PayHere sandbox dashboard, or the merchant secret will not
+authorise payments from it. Tunnel URLs change every restart on the free tiers, so both
+of these have to be redone each session.
+
+**4. Watch it land**
+
+Pay with a sandbox card. The `POST /api/payments/payhere/notify` shows up in the tunnel's
+request inspector and in the dev server output, and the order moves to `PAID` — the
+confirmation page's "we are confirming your payment" state resolves on its own within a
+few seconds.
+
+Set `NEXT_PUBLIC_APP_URL` back to `http://localhost:3000` when you are done.
 
 ## Conventions
 

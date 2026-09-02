@@ -8,6 +8,7 @@ import {
   toCheckoutFieldErrors,
   type CheckoutFormState,
 } from "@/lib/checkout-schemas";
+import { paymentPath } from "@/lib/payhere";
 import { requireAuth } from "@/server/auth";
 import { createOrder } from "@/server/orders";
 
@@ -66,8 +67,11 @@ export async function placeOrderAction(
   // route — so the whole layout, not just this page.
   revalidatePath("/", "layout");
 
-  // Feature 6 replaces this line with a hand-off to PayHere. The order is
-  // already `PENDING` with its stock committed, so the gateway only has to
-  // report back and move it to `PAID`; nothing above changes.
-  redirect(`/checkout/success/${result.orderNumber}`);
+  // Not the confirmation page — the payment step. The order exists and is
+  // `PENDING` with its stock committed, which is exactly the state PayHere is
+  // handed; `/checkout/pay/[orderNumber]` builds the signed checkout payload
+  // from the stored row, and the webhook at `/api/payments/payhere/notify` is
+  // the only thing that moves the order on from `PENDING`. Nothing above this
+  // line changed to make that work.
+  redirect(paymentPath(result.orderNumber));
 }

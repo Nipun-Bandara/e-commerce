@@ -57,10 +57,18 @@ export const config = {
   // Only these paths. Everything else — the catalogue, the cart, the sign-in
   // endpoints — is public and must not pay for a session read on every request.
   //
-  // `/checkout` exactly, not `/checkout/:path*`. A confirmation page under it
-  // answers a stranger with 404 rather than a redirect, precisely so that order
-  // numbers cannot be probed; a redirect to login would tell them the URL was
-  // worth signing in for.
+  // `/checkout` exactly, not `/checkout/:path*`. The pages under it — the
+  // payment hand-off, the confirmation, the cancellation — answer a stranger
+  // with 404 rather than a redirect, precisely so that order numbers cannot be
+  // probed; a redirect to login would tell them the URL was worth signing in
+  // for.
+  //
+  // Nothing under `/api` is matched either, and `/api/payments/payhere/notify`
+  // must stay that way: PayHere posts to it from its own servers and holds no
+  // session cookie, so a redirect to the login page would look to the gateway
+  // like a failed delivery and be retried forever. That route authenticates
+  // itself, by verifying the notification's signature against the merchant
+  // secret. Widening this matcher would break payments silently.
   matcher: [
     "/account/:path*",
     "/admin/:path*",
