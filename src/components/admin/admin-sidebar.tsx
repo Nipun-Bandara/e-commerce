@@ -28,18 +28,13 @@ type NavItem = {
   href: string;
   label: string;
   icon: typeof PackageIcon;
-  /** Rendered as a dimmed row with a "Soon" tag rather than a link. */
-  comingSoon?: boolean;
 };
 
 const NAV_ITEMS: NavItem[] = [
   { href: "/admin", label: "Dashboard", icon: LayoutDashboardIcon },
   { href: "/admin/products", label: "Products", icon: PackageIcon },
   { href: "/admin/categories", label: "Categories", icon: TagsIcon },
-  // Feature 9. Deliberately not a link: /admin/orders does not exist yet, and a
-  // nav item that answers with a 404 reads as a broken panel rather than as an
-  // unfinished one.
-  { href: "/admin/orders", label: "Orders", icon: ReceiptTextIcon, comingSoon: true },
+  { href: "/admin/orders", label: "Orders", icon: ReceiptTextIcon },
 ];
 
 /**
@@ -85,22 +80,6 @@ function NavLink({ item, current }: { item: NavItem; current: boolean }) {
 
   const base =
     "flex items-center gap-2 rounded-lg px-2.5 py-2 text-sm font-medium whitespace-nowrap transition-colors";
-
-  if (item.comingSoon) {
-    return (
-      <span
-        className={cn(base, "cursor-default text-muted-foreground/60")}
-        // Announced as unavailable rather than merely looking greyed out.
-        aria-disabled
-      >
-        <Icon className="size-4 shrink-0" aria-hidden />
-        {item.label}
-        <span className="ml-auto hidden rounded bg-muted px-1.5 py-0.5 text-[0.65rem] font-normal lg:inline">
-          Soon
-        </span>
-      </span>
-    );
-  }
 
   return (
     <Link

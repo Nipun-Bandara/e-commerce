@@ -14,7 +14,7 @@ import {
 import { prisma } from "@/lib/prisma";
 import { requireAuth } from "@/server/auth";
 import { orderTotals, type OrderTotals } from "@/server/checkout";
-import { restoreStock, takeStock } from "@/server/stock";
+import { inLockOrder, restoreStock, takeStock } from "@/server/stock";
 
 /**
  * Orders: placing one, and reading one back.
@@ -52,9 +52,10 @@ import { restoreStock, takeStock } from "@/server/stock";
  * is at the moment of the write, holding a row lock, so two buyers cannot both
  * pass the same check. A decrement that matches no row means the units went to
  * somebody else between the review page and the submit, and the transaction is
- * abandoned. Lines are decremented in product-name order, the same order they
- * are read in, so two overlapping baskets take their locks in the same sequence
- * and cannot deadlock against each other.
+ * abandoned. Lines are decremented in `inLockOrder` — by product id — so that
+ * two overlapping baskets, and a checkout overlapping a cancellation, all take
+ * their row locks in the same sequence and cannot deadlock against each other.
+ * That ordering is deliberately not the one the lines are read in.
  *
  * ## Where payment goes
  *
@@ -86,6 +87,26 @@ const ORDER_NUMBER_LENGTH = 4;
  * constraint violation is aborted and cannot be continued.
  */
 const ORDER_NUMBER_ATTEMPTS = 5;
+
+/**
+ * How long the checkout transaction gets before Postgres is told to give up.
+ *
+ * Prisma's default is 5 seconds. This transaction does one round trip per cart
+ * line for the stock decrements, plus the order and its items, so a large
+ * basket on a loaded database can run past that — and the thing it would
+ * abandon is a checkout that has already committed stock. Fifteen seconds is
+ * still short enough that a genuinely stuck transaction releases its row locks
+ * rather than blocking every other buyer of the same products.
+ */
+const TRANSACTION_TIMEOUT_MS = 15_000;
+
+/**
+ * How long to wait for a free connection before abandoning the attempt.
+ *
+ * Waiting here costs nothing but latency — no locks are held and no rows have
+ * been touched yet, so a timeout at this stage is a clean failure.
+ */
+const TRANSACTION_MAX_WAIT_MS = 5_000;
 
 const EMPTY_CART_MESSAGE =
   "Your cart is empty. It may already have been ordered — check your orders before trying again.";
@@ -173,25 +194,95 @@ function isOrderNumberCollision(error: unknown): boolean {
  * address becomes the default, which is what makes the next checkout arrive
  * pre-filled.
  *
- * Failing here would roll the order back, which would be a poor trade for a
- * convenience — so this runs last, after everything that must succeed.
+ * **Runs after the order transaction has committed, on the plain client.** It
+ * used to run inside it, last, on the theory that being last kept it from
+ * rolling the order back. Ordering does not do that — anything that throws
+ * inside a transaction unwinds all of it, whenever it runs — so a failure to
+ * save a convenience address would have discarded the order that was just
+ * placed. Out here it cannot.
+ *
+ * The cost of moving it is a race the cart lock used to cover: two orders from
+ * one account, committing back to back, can both find no saved match and both
+ * insert. That is a duplicate row in an address picker. It is the right side of
+ * this trade.
  */
 async function saveShippingAddress(
-  tx: Prisma.TransactionClient,
   userId: string,
   shipping: ShippingAddressInput,
 ): Promise<void> {
-  const existing = await tx.address.findFirst({
+  const existing = await prisma.address.findFirst({
     where: { userId, ...shipping },
     select: { id: true },
   });
   if (existing) return;
 
-  const saved = await tx.address.count({ where: { userId } });
+  const saved = await prisma.address.count({ where: { userId } });
 
-  await tx.address.create({
+  await prisma.address.create({
     data: { userId, ...shipping, isDefault: saved === 0 },
   });
+}
+
+/**
+ * Save the address without letting it affect the outcome of the order.
+ *
+ * The order is already committed by the time this runs. A visitor who has just
+ * been told their order was placed must not then see it fail because a checkbox
+ * could not be honoured, so the failure is logged and swallowed.
+ */
+async function rememberAddress(
+  userId: string,
+  shipping: ShippingAddressInput,
+): Promise<void> {
+  try {
+    await saveShippingAddress(userId, shipping);
+  } catch (error) {
+    console.error("Could not save shipping address for user %s", userId, error);
+  }
+}
+
+/**
+ * Why did the conditional decrement match no row?
+ *
+ * `takeStock` refuses on two different conditions — the product was deactivated,
+ * or the units are no longer there — and it returns one `false` for both. Saying
+ * "sold out" to someone whose item was quietly delisted sends them to support
+ * for an answer the page could have given them.
+ *
+ * Only ever reached on the failure path, immediately before the transaction
+ * unwinds, so the extra read costs nothing that a successful checkout pays for.
+ * It reads through `tx`, so it sees the same snapshot the failed write did.
+ */
+async function explainStockFailure(
+  tx: Prisma.TransactionClient,
+  line: { productId: string; productName: string; quantity: number },
+): Promise<OrderFailure> {
+  const product = await tx.product.findUnique({
+    where: { id: line.productId },
+    select: { stock: true, isActive: true },
+  });
+
+  // Deleted outright, or delisted between the review page and this write.
+  if (!product || !product.isActive) {
+    return failed(
+      "item-unavailable",
+      `${line.productName} is no longer available. Remove it from your cart to continue.`,
+    );
+  }
+
+  // Still for sale, but somebody else got there first. Whether any are left
+  // decides which of the two things to tell them to do.
+  if (product.stock > 0) {
+    return failed(
+      "insufficient-stock",
+      `Only ${product.stock} of ${line.productName} left. Update your cart to continue.`,
+    );
+  }
+
+  return failed(
+    "insufficient-stock",
+    `${line.productName} sold out while you were checking out. Nothing has been ordered.`,
+  );
 }
 
 /**
@@ -205,7 +296,7 @@ async function placeOrder({
   shipping,
   saveAddress,
 }: CreateOrderInput): Promise<CreateOrderResult> {
-  return prisma.$transaction(async (tx) => {
+  const attempt = async (tx: Prisma.TransactionClient): Promise<CreateOrderResult> => {
     const cart = await tx.cart.findUnique({
       where: { userId },
       select: { id: true },
@@ -225,8 +316,9 @@ async function placeOrder({
           select: { id: true, name: true, price: true, stock: true, isActive: true },
         },
       },
-      // Sorted so the decrements below take their row locks in a consistent
-      // order across concurrent checkouts. See the deadlock note above.
+      // Sorted for the visitor: the same order the cart and the review step
+      // listed them in. The stock decrements below deliberately do not use it —
+      // they re-sort by product id. See the deadlock note above.
       orderBy: { product: { name: "asc" } },
     });
     if (rows.length === 0) {
@@ -264,21 +356,18 @@ async function placeOrder({
 
     const totals = orderTotals(lines.map((line) => line.lineTotal));
 
-    for (const line of lines) {
+    // `inLockOrder`, not the order the lines were read in. The read is sorted
+    // by product name for the visitor's benefit; row locks have to be taken in
+    // an order every other stock write agrees with, and that is by id. See the
+    // note on `inLockOrder`.
+    for (const line of inLockOrder(lines)) {
       // The conditional update, in `server/stock.ts`. Postgres — not this
       // process — decides whether the units are there, at the moment of the
       // write. `false` means they are not. Cancelling an order calls that
       // module's other half to put them back.
       const taken = await takeStock(tx, line);
 
-      if (!taken) {
-        throw new OrderAborted(
-          failed(
-            "insufficient-stock",
-            `${line.productName} sold out while you were checking out. Nothing has been ordered.`,
-          ),
-        );
-      }
+      if (!taken) throw new OrderAborted(await explainStockFailure(tx, line));
     }
 
     const order = await tx.order.create({
@@ -320,10 +409,22 @@ async function placeOrder({
 
     await tx.cartItem.deleteMany({ where: { cartId: cart.id } });
 
-    if (saveAddress) await saveShippingAddress(tx, userId, shipping);
-
     return { status: "created", orderNumber: order.orderNumber };
+  };
+
+  const result = await prisma.$transaction(attempt, {
+    timeout: TRANSACTION_TIMEOUT_MS,
+    maxWait: TRANSACTION_MAX_WAIT_MS,
   });
+
+  // Outside the transaction on purpose, and only once it has committed — see
+  // the note on `saveShippingAddress`. An order that failed has no address
+  // worth keeping, so this is skipped for anything but a created one.
+  if (saveAddress && result.status === "created") {
+    await rememberAddress(userId, shipping);
+  }
+
+  return result;
 }
 
 /**
