@@ -6,8 +6,15 @@ import { Prisma } from "@/generated/prisma/client";
 import { OrderStatus } from "@/generated/prisma/enums";
 import type { ShippingAddressInput } from "@/lib/checkout-schemas";
 import { lineTotal, type Money } from "@/lib/money";
+import {
+  CANCELLABLE_STATUSES,
+  ORDERS_PAGE_SIZE,
+  ORDERS_PATH,
+} from "@/lib/order-status";
 import { prisma } from "@/lib/prisma";
+import { requireAuth } from "@/server/auth";
 import { orderTotals, type OrderTotals } from "@/server/checkout";
+import { inLockOrder, restoreStock, takeStock } from "@/server/stock";
 
 /**
  * Orders: placing one, and reading one back.
@@ -45,9 +52,10 @@ import { orderTotals, type OrderTotals } from "@/server/checkout";
  * is at the moment of the write, holding a row lock, so two buyers cannot both
  * pass the same check. A decrement that matches no row means the units went to
  * somebody else between the review page and the submit, and the transaction is
- * abandoned. Lines are decremented in product-name order, the same order they
- * are read in, so two overlapping baskets take their locks in the same sequence
- * and cannot deadlock against each other.
+ * abandoned. Lines are decremented in `inLockOrder` — by product id — so that
+ * two overlapping baskets, and a checkout overlapping a cancellation, all take
+ * their row locks in the same sequence and cannot deadlock against each other.
+ * That ordering is deliberately not the one the lines are read in.
  *
  * ## Where payment goes
  *
@@ -79,6 +87,26 @@ const ORDER_NUMBER_LENGTH = 4;
  * constraint violation is aborted and cannot be continued.
  */
 const ORDER_NUMBER_ATTEMPTS = 5;
+
+/**
+ * How long the checkout transaction gets before Postgres is told to give up.
+ *
+ * Prisma's default is 5 seconds. This transaction does one round trip per cart
+ * line for the stock decrements, plus the order and its items, so a large
+ * basket on a loaded database can run past that — and the thing it would
+ * abandon is a checkout that has already committed stock. Fifteen seconds is
+ * still short enough that a genuinely stuck transaction releases its row locks
+ * rather than blocking every other buyer of the same products.
+ */
+const TRANSACTION_TIMEOUT_MS = 15_000;
+
+/**
+ * How long to wait for a free connection before abandoning the attempt.
+ *
+ * Waiting here costs nothing but latency — no locks are held and no rows have
+ * been touched yet, so a timeout at this stage is a clean failure.
+ */
+const TRANSACTION_MAX_WAIT_MS = 5_000;
 
 const EMPTY_CART_MESSAGE =
   "Your cart is empty. It may already have been ordered — check your orders before trying again.";
@@ -166,25 +194,95 @@ function isOrderNumberCollision(error: unknown): boolean {
  * address becomes the default, which is what makes the next checkout arrive
  * pre-filled.
  *
- * Failing here would roll the order back, which would be a poor trade for a
- * convenience — so this runs last, after everything that must succeed.
+ * **Runs after the order transaction has committed, on the plain client.** It
+ * used to run inside it, last, on the theory that being last kept it from
+ * rolling the order back. Ordering does not do that — anything that throws
+ * inside a transaction unwinds all of it, whenever it runs — so a failure to
+ * save a convenience address would have discarded the order that was just
+ * placed. Out here it cannot.
+ *
+ * The cost of moving it is a race the cart lock used to cover: two orders from
+ * one account, committing back to back, can both find no saved match and both
+ * insert. That is a duplicate row in an address picker. It is the right side of
+ * this trade.
  */
 async function saveShippingAddress(
-  tx: Prisma.TransactionClient,
   userId: string,
   shipping: ShippingAddressInput,
 ): Promise<void> {
-  const existing = await tx.address.findFirst({
+  const existing = await prisma.address.findFirst({
     where: { userId, ...shipping },
     select: { id: true },
   });
   if (existing) return;
 
-  const saved = await tx.address.count({ where: { userId } });
+  const saved = await prisma.address.count({ where: { userId } });
 
-  await tx.address.create({
+  await prisma.address.create({
     data: { userId, ...shipping, isDefault: saved === 0 },
   });
+}
+
+/**
+ * Save the address without letting it affect the outcome of the order.
+ *
+ * The order is already committed by the time this runs. A visitor who has just
+ * been told their order was placed must not then see it fail because a checkbox
+ * could not be honoured, so the failure is logged and swallowed.
+ */
+async function rememberAddress(
+  userId: string,
+  shipping: ShippingAddressInput,
+): Promise<void> {
+  try {
+    await saveShippingAddress(userId, shipping);
+  } catch (error) {
+    console.error("Could not save shipping address for user %s", userId, error);
+  }
+}
+
+/**
+ * Why did the conditional decrement match no row?
+ *
+ * `takeStock` refuses on two different conditions — the product was deactivated,
+ * or the units are no longer there — and it returns one `false` for both. Saying
+ * "sold out" to someone whose item was quietly delisted sends them to support
+ * for an answer the page could have given them.
+ *
+ * Only ever reached on the failure path, immediately before the transaction
+ * unwinds, so the extra read costs nothing that a successful checkout pays for.
+ * It reads through `tx`, so it sees the same snapshot the failed write did.
+ */
+async function explainStockFailure(
+  tx: Prisma.TransactionClient,
+  line: { productId: string; productName: string; quantity: number },
+): Promise<OrderFailure> {
+  const product = await tx.product.findUnique({
+    where: { id: line.productId },
+    select: { stock: true, isActive: true },
+  });
+
+  // Deleted outright, or delisted between the review page and this write.
+  if (!product || !product.isActive) {
+    return failed(
+      "item-unavailable",
+      `${line.productName} is no longer available. Remove it from your cart to continue.`,
+    );
+  }
+
+  // Still for sale, but somebody else got there first. Whether any are left
+  // decides which of the two things to tell them to do.
+  if (product.stock > 0) {
+    return failed(
+      "insufficient-stock",
+      `Only ${product.stock} of ${line.productName} left. Update your cart to continue.`,
+    );
+  }
+
+  return failed(
+    "insufficient-stock",
+    `${line.productName} sold out while you were checking out. Nothing has been ordered.`,
+  );
 }
 
 /**
@@ -198,7 +296,7 @@ async function placeOrder({
   shipping,
   saveAddress,
 }: CreateOrderInput): Promise<CreateOrderResult> {
-  return prisma.$transaction(async (tx) => {
+  const attempt = async (tx: Prisma.TransactionClient): Promise<CreateOrderResult> => {
     const cart = await tx.cart.findUnique({
       where: { userId },
       select: { id: true },
@@ -218,8 +316,9 @@ async function placeOrder({
           select: { id: true, name: true, price: true, stock: true, isActive: true },
         },
       },
-      // Sorted so the decrements below take their row locks in a consistent
-      // order across concurrent checkouts. See the deadlock note above.
+      // Sorted for the visitor: the same order the cart and the review step
+      // listed them in. The stock decrements below deliberately do not use it —
+      // they re-sort by product id. See the deadlock note above.
       orderBy: { product: { name: "asc" } },
     });
     if (rows.length === 0) {
@@ -257,27 +356,18 @@ async function placeOrder({
 
     const totals = orderTotals(lines.map((line) => line.lineTotal));
 
-    for (const line of lines) {
-      // The conditional update. `stock >= quantity` is part of the WHERE, so
-      // Postgres — not this process — decides whether the units are there, at
-      // the moment of the write. Zero rows matched means they are not.
-      const { count } = await tx.product.updateMany({
-        where: {
-          id: line.productId,
-          isActive: true,
-          stock: { gte: line.quantity },
-        },
-        data: { stock: { decrement: line.quantity } },
-      });
+    // `inLockOrder`, not the order the lines were read in. The read is sorted
+    // by product name for the visitor's benefit; row locks have to be taken in
+    // an order every other stock write agrees with, and that is by id. See the
+    // note on `inLockOrder`.
+    for (const line of inLockOrder(lines)) {
+      // The conditional update, in `server/stock.ts`. Postgres — not this
+      // process — decides whether the units are there, at the moment of the
+      // write. `false` means they are not. Cancelling an order calls that
+      // module's other half to put them back.
+      const taken = await takeStock(tx, line);
 
-      if (count === 0) {
-        throw new OrderAborted(
-          failed(
-            "insufficient-stock",
-            `${line.productName} sold out while you were checking out. Nothing has been ordered.`,
-          ),
-        );
-      }
+      if (!taken) throw new OrderAborted(await explainStockFailure(tx, line));
     }
 
     const order = await tx.order.create({
@@ -319,10 +409,22 @@ async function placeOrder({
 
     await tx.cartItem.deleteMany({ where: { cartId: cart.id } });
 
-    if (saveAddress) await saveShippingAddress(tx, userId, shipping);
-
     return { status: "created", orderNumber: order.orderNumber };
+  };
+
+  const result = await prisma.$transaction(attempt, {
+    timeout: TRANSACTION_TIMEOUT_MS,
+    maxWait: TRANSACTION_MAX_WAIT_MS,
   });
+
+  // Outside the transaction on purpose, and only once it has committed — see
+  // the note on `saveShippingAddress`. An order that failed has no address
+  // worth keeping, so this is skipped for anything but a created one.
+  if (saveAddress && result.status === "created") {
+    await rememberAddress(userId, shipping);
+  }
+
+  return result;
 }
 
 /**
@@ -359,6 +461,15 @@ export type OrderItemView = {
   unitPrice: Money;
   quantity: number;
   lineTotal: Money;
+  /**
+   * Where this line can still be bought again, or `null`.
+   *
+   * The *only* thing read from the live `Product` row, and it decides one
+   * thing: whether the name renders as a link. It is `null` when the product
+   * has been deleted (`productId` went NULL) or deactivated, because a link to
+   * a page that 404s is worse than plain text.
+   */
+  productSlug: string | null;
 };
 
 export type OrderView = {
@@ -415,9 +526,13 @@ export async function getOrderByNumberForUser(
           productName: true,
           unitPrice: true,
           quantity: true,
+          // Joined for one purpose: deciding whether the name is a link. Not
+          // for the name, not for the price — those are the snapshot columns
+          // above, and they are what this order says it was.
+          product: { select: { slug: true, isActive: true } },
         },
-        // Not joined to Product to sort, for the same reason it is not joined
-        // to read the name: the snapshot is the order.
+        // Sorted on the snapshot too, for the same reason: renaming a product
+        // must not reshuffle an order somebody has already been shown.
         orderBy: { productName: "asc" },
       },
     },
@@ -447,6 +562,213 @@ export async function getOrderByNumberForUser(
       unitPrice: item.unitPrice,
       quantity: item.quantity,
       lineTotal: lineTotal(item.unitPrice, item.quantity),
+      productSlug: item.product?.isActive ? item.product.slug : null,
     })),
   };
+}
+
+/**
+ * The order history: reading it, and cancelling from it.
+ *
+ * Both readers below resolve the user themselves rather than taking an id.
+ * `getOrderByNumberForUser` above takes one because the confirmation page has a
+ * reason to answer a signed-out visitor with a 404 instead of a redirect; under
+ * /account there is no such case, and a `userId` parameter would be one more
+ * place a caller could pass the wrong thing. `requireAuth` is called here as
+ * well as in the page: the proxy is optimistic, a page's guard protects that
+ * page, and a query that scopes itself protects every future caller of it.
+ */
+
+export type OrderListItem = {
+  orderNumber: string;
+  status: OrderStatus;
+  placedAt: Date;
+  /** Units, not lines: two of one thing reads as "2 items", not "1 item". */
+  itemCount: number;
+  total: Money;
+};
+
+export type GetUserOrdersOptions = {
+  /** 1-based. Clamped into range, so an out-of-range `?page=` is harmless. */
+  page?: number;
+  pageSize?: number;
+  /** Omit for every status. */
+  status?: OrderStatus;
+};
+
+/**
+ * One page of the signed-in user's orders, newest first.
+ *
+ * `userId` is part of the `where`, not a filter applied to the results. There
+ * is no moment in this function when another account's row has been fetched.
+ *
+ * `createdAt` alone would not be a stable sort — the seed and a burst of
+ * checkouts both produce ties, and tied rows may come back in a different order
+ * for the page-2 query than the page-1 query, which makes an order appear twice
+ * or not at all. `id` is unique, so it settles them.
+ */
+export async function getUserOrders({
+  page = 1,
+  pageSize = ORDERS_PAGE_SIZE,
+  status,
+}: GetUserOrdersOptions = {}) {
+  const user = await requireAuth(ORDERS_PATH);
+  const take = Math.max(1, Math.trunc(pageSize));
+
+  const where: Prisma.OrderWhereInput = {
+    userId: user.id,
+    ...(status ? { status } : {}),
+  };
+
+  // Counted before the page is fetched, because the page number is clamped
+  // against it: asking for page 99 of 3 gives the last page, not a blank list.
+  const total = await prisma.order.count({ where });
+  const pageCount = Math.max(1, Math.ceil(total / take));
+  const currentPage = Math.min(Math.max(1, Math.trunc(page)), pageCount);
+
+  const rows = await prisma.order.findMany({
+    where,
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    select: {
+      orderNumber: true,
+      status: true,
+      createdAt: true,
+      total: true,
+      // Quantities only. The row shows how many things were bought, and
+      // summing here beats a second query per order.
+      items: { select: { quantity: true } },
+    },
+    skip: (currentPage - 1) * take,
+    take,
+  });
+
+  const orders: OrderListItem[] = rows.map((row) => ({
+    orderNumber: row.orderNumber,
+    status: row.status,
+    placedAt: row.createdAt,
+    itemCount: row.items.reduce((count, item) => count + item.quantity, 0),
+    total: row.total,
+  }));
+
+  return { orders, total, page: currentPage, pageSize: take, pageCount };
+}
+
+/** How many orders this account has ever placed, across every status. */
+export async function countUserOrders(): Promise<number> {
+  const user = await requireAuth(ORDERS_PATH);
+
+  return prisma.order.count({ where: { userId: user.id } });
+}
+
+/**
+ * One of the signed-in user's orders, or `null`.
+ *
+ * `null` for a stranger's order number as well as for one that does not exist,
+ * and the page renders the same 404 for both. See the note on
+ * {@link getOrderByNumberForUser}, which does the query: a 403 would confirm
+ * that the number is real, which is precisely what someone working through
+ * `ORD-…-AAAA`, `ORD-…-AAAB` is trying to find out.
+ */
+export async function getUserOrderByNumber(
+  orderNumber: string,
+): Promise<OrderView | null> {
+  const user = await requireAuth(`${ORDERS_PATH}/${orderNumber}`);
+
+  return getOrderByNumberForUser(orderNumber, user.id);
+}
+
+export type CancelOrderResult =
+  /** Cancelled by this call. Stock has been put back. */
+  | { status: "cancelled"; message: string }
+  /** Already cancelled — by a previous call, or in another tab. Nothing changed. */
+  | { status: "already-cancelled"; message: string }
+  /** Too far along to call off, or not this user's order. Nothing changed. */
+  | { status: "rejected"; message: string };
+
+/**
+ * Cancel one of the signed-in user's orders, and put its stock back.
+ *
+ * Every rule the button appears to enforce is enforced here instead, because
+ * a Server Action is a POST that anybody can make and a hidden button stops
+ * nobody:
+ *
+ *  - **Ownership** is in the `where` of the first read, so a stranger's order
+ *    number is indistinguishable from a made-up one.
+ *  - **Cancellability** is in the `where` of the update, not checked against
+ *    the status read a moment earlier. Postgres evaluates it against the row as
+ *    it is at the moment of the write, holding the row lock, so a second
+ *    request — a double click, a second tab, a replayed POST — matches zero
+ *    rows and takes the idempotent path.
+ *  - **Restoring stock happens in the branch that won that update**, and only
+ *    there. That is what makes the units come back exactly once rather than
+ *    once per attempt.
+ *
+ * The update and the restoration are one transaction: an order marked
+ * `CANCELLED` whose stock never came back is silently unsellable inventory.
+ */
+export async function cancelOrder(
+  orderNumber: string,
+): Promise<CancelOrderResult> {
+  const user = await requireAuth(`${ORDERS_PATH}/${orderNumber}`);
+
+  return prisma.$transaction(async (tx) => {
+    const order = await tx.order.findFirst({
+      where: { orderNumber, userId: user.id },
+      select: { id: true },
+    });
+    if (!order) {
+      return {
+        status: "rejected",
+        message: "We could not find that order.",
+      };
+    }
+
+    const { count } = await tx.order.updateMany({
+      where: { id: order.id, status: { in: [...CANCELLABLE_STATUSES] } },
+      data: { status: OrderStatus.CANCELLED },
+    });
+
+    if (count === 0) {
+      // Re-read rather than reuse a status from before the update: if another
+      // request held the row lock, this update waited for it and the status it
+      // failed against is the one that request committed.
+      const current = await tx.order.findFirstOrThrow({
+        where: { id: order.id },
+        select: { status: true },
+      });
+
+      if (current.status === OrderStatus.CANCELLED) {
+        return {
+          status: "already-cancelled",
+          message: `Order ${orderNumber} was already cancelled. Nothing has changed.`,
+        };
+      }
+
+      return {
+        status: "rejected",
+        message: `Order ${orderNumber} is already ${current.status.toLowerCase()} and can no longer be cancelled. Contact us if you need help with it.`,
+      };
+    }
+
+    const items = await tx.orderItem.findMany({
+      // A line whose product has been deleted has `productId` NULL and no row
+      // to credit. Excluded in the query rather than skipped in a loop.
+      where: { orderId: order.id, productId: { not: null } },
+      select: { productId: true, quantity: true },
+    });
+
+    await restoreStock(
+      tx,
+      // `productId: { not: null }` narrows the rows but not the type.
+      items.map((item) => ({
+        productId: item.productId as string,
+        quantity: item.quantity,
+      })),
+    );
+
+    return {
+      status: "cancelled",
+      message: `Order ${orderNumber} has been cancelled.`,
+    };
+  });
 }

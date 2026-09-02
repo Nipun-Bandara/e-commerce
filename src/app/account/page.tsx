@@ -1,6 +1,10 @@
 import type { Metadata } from "next";
+import Link from "next/link";
+import { ChevronRightIcon, PackageIcon } from "lucide-react";
 
+import { ORDERS_PATH } from "@/lib/order-status";
 import { requireAuth } from "@/server/auth";
+import { countUserOrders } from "@/server/orders";
 
 export const metadata: Metadata = {
   title: "My account",
@@ -12,6 +16,7 @@ export default async function AccountPage() {
   // cookie, this reads the session the page will actually render from, and it
   // is the one that runs if the matcher ever stops covering this route.
   const user = await requireAuth("/account");
+  const orderCount = await countUserOrders();
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-8 px-4 py-12 sm:px-6 lg:px-8">
@@ -37,6 +42,27 @@ export default async function AccountPage() {
       <p className="text-sm text-muted-foreground">
         Editing these is not built yet.
       </p>
+
+      <Link
+        href={ORDERS_PATH}
+        className="flex items-center gap-4 rounded-xl border border-border px-5 py-4 transition-colors hover:bg-muted/50 focus-visible:bg-muted/50 focus-visible:outline-none"
+      >
+        <PackageIcon className="size-5 shrink-0 text-muted-foreground" aria-hidden />
+
+        <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+          <span className="text-sm font-medium">Order history</span>
+          <span className="text-sm text-muted-foreground">
+            {orderCount === 0
+              ? "You have not placed any orders yet"
+              : `${orderCount} ${orderCount === 1 ? "order" : "orders"} placed`}
+          </span>
+        </div>
+
+        <ChevronRightIcon
+          aria-hidden
+          className="size-4 shrink-0 text-muted-foreground"
+        />
+      </Link>
     </div>
   );
 }

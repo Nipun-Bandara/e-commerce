@@ -7,7 +7,17 @@ const nextConfig: NextConfig = {
     // here, so the seeded catalogue renders as broken images without this.
     // picsum redirects to its CDN; Next follows the redirect without
     // re-checking the pattern, so only the entry host needs allowing.
-    remotePatterns: [new URL("https://picsum.photos/seed/**")],
+    remotePatterns: [
+      new URL("https://picsum.photos/seed/**"),
+
+      // Admin uploads land on UploadThing and are served from
+      // `<appId>.ufs.sh/f/<key>`. The app id is part of the hostname and comes
+      // from whichever UPLOADTHING_TOKEN is configured, so this has to be a
+      // wildcard subdomain — which the `new URL()` form above cannot express,
+      // hence the object. `**.` matches any depth of subdomain; the pathname
+      // still pins it to the file route.
+      { protocol: "https", hostname: "**.ufs.sh", pathname: "/f/**" },
+    ],
   },
 
   experimental: {
