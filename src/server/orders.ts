@@ -60,12 +60,13 @@ import { inLockOrder, restoreStock, takeStock } from "@/server/stock";
  * ## Where payment goes
  *
  * An order lands as `PENDING` and stock is committed to it immediately. That is
- * deliberate: the next feature puts a payment gateway between creation and
- * confirmation, and the shape it needs is exactly this one. `createOrder`
- * returns an order number, and the caller decides where to send the visitor —
- * today straight to the confirmation page, tomorrow to PayHere, with the
- * gateway's callback moving that same order from `PENDING` to `PAID`. Nothing
- * in this transaction has to change for that.
+ * deliberate: a payment gateway sits between creation and confirmation, and the
+ * shape it needs is exactly this one. `createOrder` returns an order number and
+ * `placeOrderAction` sends the visitor to `/checkout/pay/[orderNumber]`, which
+ * hands the stored row to PayHere. Moving that order on from `PENDING` — to
+ * `PAID`, or to `CANCELLED` with its stock put back — is the sole business of
+ * the signed webhook in `src/server/payments.ts`. Nothing in this transaction
+ * had to change for any of it.
  */
 
 /**
