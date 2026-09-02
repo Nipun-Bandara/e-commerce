@@ -4,8 +4,9 @@ import { notFound } from "next/navigation";
 import { CircleCheckIcon } from "lucide-react";
 
 import OrderSummary from "@/components/order-summary";
-import { Badge } from "@/components/ui/badge";
+import OrderStatusBadge from "@/components/order-status-badge";
 import { buttonVariants } from "@/components/ui/button";
+import { formatOrderDate } from "@/lib/dates";
 import { cn } from "@/lib/utils";
 import { getCurrentUser } from "@/server/auth";
 import { getOrderByNumberForUser } from "@/server/orders";
@@ -17,12 +18,6 @@ export const metadata: Metadata = {
   // already enforced below; this stops the page being indexed on top of it.
   robots: { index: false, follow: false },
 };
-
-/** The store ships from Colombo, so that is the day an order was placed on. */
-const placedAtFormat = new Intl.DateTimeFormat("en-GB", {
-  dateStyle: "long",
-  timeZone: "Asia/Colombo",
-});
 
 export default async function OrderConfirmationPage({
   params,
@@ -56,10 +51,10 @@ export default async function OrderConfirmationPage({
           <span className="font-medium text-foreground tabular-nums">
             {order.orderNumber}
           </span>
-          , placed {placedAtFormat.format(order.placedAt)}.
+          , placed {formatOrderDate(order.placedAt)}.
         </p>
 
-        <Badge variant="secondary">{titleCase(order.status)}</Badge>
+        <OrderStatusBadge status={order.status} />
       </header>
 
       <div className="flex flex-col gap-6 lg:flex-row lg:items-start">
@@ -100,9 +95,10 @@ export default async function OrderConfirmationPage({
       </div>
 
       <div className="flex flex-col gap-3 sm:flex-row sm:justify-center">
-        {/* Order history is a later feature; /account is where it will live,
-            and is the page that already knows who is asking. */}
-        <Link href="/account" className={cn(buttonVariants({ variant: "outline" }))}>
+        <Link
+          href="/account/orders"
+          className={cn(buttonVariants({ variant: "outline" }))}
+        >
           View my orders
         </Link>
 
@@ -112,9 +108,4 @@ export default async function OrderConfirmationPage({
       </div>
     </div>
   );
-}
-
-/** `PENDING` reads as shouting in a sentence people are meant to be reassured by. */
-function titleCase(value: string): string {
-  return value.charAt(0) + value.slice(1).toLowerCase();
 }
